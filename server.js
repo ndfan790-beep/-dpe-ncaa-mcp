@@ -44,18 +44,48 @@ function ncaaDate(year, month, day) {
   return `${pad2(month)}/${pad2(day)}/${year}`;
 }
 
+/**
+ * NCAA football scoreboards are addressed by SEASON/WEEK, NOT YYYY/MM/DD.
+ * Bound candidate weeks near the requested calendar date; never silently
+ * interpret a month as a week or return a success-shaped empty roster.
+ * Read-only, no player requests until exact-date scoreboard is validated.
+ */
 async function getFilteredScoreboard(year, month, day) {
-  const data = await ncaaFetch(
-    `/scoreboard/football/fbs/${year}/${month}/${day}`
-  );
-
   const wanted = ncaaDate(year, month, day);
-  const games = Array.isArray(data?.games) ? data.games : [];
-
-  return {
-    ...data,
-    games: games.filter((row) => row?.game?.startDate === wanted)
-  };
+  const target = new Date(Date.UTC(year, month - 1, day));
+  if (target.getUTCFullYear() !== year ||
+      target.getUTCMonth() !== month - 1 ||
+      target.getUTCDate() !== day) throw new Error("INVALID_SCOREBOARD_DATE");
+  // CFB football season begins late August; tolerate variation across years.
+  // Jan belongs to previous football season. No blind all-season scan.
+  const season = month <= 2 ? year - 1 : year;
+  const anchor = new Date(Date.UTC(season, 7, 29));
+  const estimated = Math.floor((target - anchor) / (7 * 86400000));
+  if (estimated < -1 || estimated > 23) throw new Error("OUTSIDE_FBS_REGULAR_WEEK_DISCOVERY_WINDOW");
+  const candidates = [...new Set(
+    [estimated, estimated + 1, estimated - 1, estimated + 2, estimated - 2]
+      .filter(week => week >= 0 && week <= 20)
+  )];
+  const observations = [];
+  for (const week of candidates) {
+    const data = await ncaaFetch(
+      `/scoreboard/football/fbs/${season}/${String(week).padStart(2, "0")}/all-conf`
+    );
+    const games = Array.isArray(data?.games) ? data.games : [];
+    const exact = games.filter(row => row?.game?.startDate === wanted);
+    observations.push({week, returned: games.length, exact: exact.length});
+    if (exact.length) {
+      return {
+        ...data,
+        games: exact,
+        discovery: {requestedDate: wanted, season, week, examined: observations}
+      };
+    }
+  }
+  throw new Error(
+    "NCAA_EXACT_DATE_SCOREBOARD_NOT_FOUND: " +
+    JSON.stringify({requestedDate: wanted, season, examined: observations})
+  );
 }
 
 async function mapWithConcurrency(items, concurrency, fn) {
